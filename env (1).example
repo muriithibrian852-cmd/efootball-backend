@@ -1,0 +1,13 @@
+# Copy this file to ".env" (same folder) and fill in your real values.
+# NEVER commit the real .env file or share your secret key publicly.
+
+# Get this from Paystack Dashboard → Settings → API Keys & Webhooks.
+# This is the SECRET key (starts with sk_) — different from the PUBLIC key
+# used in the frontend. This one must only ever live on the server.
+PAYSTACK_SECRET_KEY=sk_test_REPLACE_WITH_YOUR_SECRET_KEY
+
+# Must match PRICE_PER_VOTE in the frontend's data.js
+PRICE_PER_VOTE=20
+
+# Port the server runs on locally (most hosts override this automatically)
+PORT=5000
