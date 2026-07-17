@@ -1,13 +1,18 @@
-# Copy this file to ".env" (same folder) and fill in your real values.
-# NEVER commit the real .env file or share your secret key publicly.
+# Copy locally as ".env" for testing, or type these into Render's
+# Environment Variables dashboard for the live deployment.
 
-# Get this from Paystack Dashboard → Settings → API Keys & Webhooks.
-# This is the SECRET key (starts with sk_) — different from the PUBLIC key
-# used in the frontend. This one must only ever live on the server.
-PAYSTACK_SECRET_KEY=sk_test_REPLACE_WITH_YOUR_SECRET_KEY
+# Log into app.payhero.co.ke → API Keys menu → follow "How To Get Basic
+# Auth Token From UI" in their docs. Paste the WHOLE value including the
+# word "Basic " at the start, e.g: Basic bXlfdXNlcm5hbWU6bXlfcGFzc3dvcmQ=
+PAYHERO_AUTH_TOKEN=Basic REPLACE_WITH_YOUR_FULL_TOKEN
 
-# Must match PRICE_PER_VOTE in the frontend's data.js
+# app.payhero.co.ke → Payment Channels → My Payment Channels → the ID
+# number next to your registered paybill/till
+PAYHERO_CHANNEL_ID=REPLACE_WITH_YOUR_CHANNEL_ID
+
+# Must be your Render backend's real public URL + /api/payhero/callback
+# e.g. https://efootball-vote-backend.onrender.com/api/payhero/callback
+PAYHERO_CALLBACK_URL=REPLACE_WITH_YOUR_CALLBACK_URL
+
 PRICE_PER_VOTE=20
-
-# Port the server runs on locally (most hosts override this automatically)
 PORT=5000
