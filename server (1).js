@@ -1,16 +1,17 @@
 /* =========================================================================
-   SERVER.JS — MatchdayVote Backend
+   SERVER.JS — MatchdayVote Backend (PayHero STK Push, JSON-file storage)
    -------------------------------------------------------------------------
-   What this does:
-   1. Stores vote counts centrally in a JSON file (votes.json) so every
-      visitor sees the SAME numbers — not just their own browser.
-   2. Verifies every payment with Paystack's secret key BEFORE crediting a
-      vote, so nobody can fake a "successful payment" from the browser.
-   3. Prevents the same payment reference from being credited twice.
-   4. Serves a simple /api/candidates endpoint the frontend polls to stay
-      in sync with everyone else's votes.
+   Uses PayHero (payherokenya.com) instead of direct Safaricom Daraja or
+   Paystack. PayHero handles all the M-Pesa-specific complexity for you —
+   you just call their API with a Basic Auth token.
 
-   Requires Node.js 18+ (for built-in fetch). Check with: node -v
+   Flow:
+   1. Frontend sends phone number + vote details to /api/payhero/stkpush
+   2. This file asks PayHero to trigger an STK push to that phone
+   3. PayHero calls US BACK at /api/payhero/callback once the customer
+      enters their PIN (needs a public HTTPS URL — Render gives you that)
+   4. Frontend polls /api/payhero/status/:id every few seconds until it
+      sees "completed" or "failed"
    ========================================================================= */
 
 const express = require("express");
@@ -20,17 +21,21 @@ const path = require("path");
 require("dotenv").config();
 
 const app = express();
-app.use(cors());              // allows your frontend (on a different domain) to call this API
+app.use(cors());
 app.use(express.json());
 
 const PORT = process.env.PORT || 5000;
-const PAYSTACK_SECRET_KEY = process.env.PAYSTACK_SECRET_KEY; // ⚠️ set this in your .env — never in frontend code
-const PRICE_PER_VOTE = Number(process.env.PRICE_PER_VOTE || 50); // must match data.js on the frontend
+const PRICE_PER_VOTE = Number(process.env.PRICE_PER_VOTE || 20);
 const DB_FILE = path.join(__dirname, "votes.json");
 
+// ⚠️ The full "Basic xxxxxxx==" string from PayHero's dashboard — see
+// Authorization docs: "How To Get Basic Auth Token From UI"
+const PAYHERO_AUTH_TOKEN = process.env.PAYHERO_AUTH_TOKEN;
+const PAYHERO_CHANNEL_ID = process.env.PAYHERO_CHANNEL_ID;
+const PAYHERO_CALLBACK_URL = process.env.PAYHERO_CALLBACK_URL; // e.g. https://your-backend.onrender.com/api/payhero/callback
+
 /* -------------------------------------------------------------------------
-   Simple JSON-file "database". Good enough for a contest like this.
-   Structure: { candidates: { a1: 0, a2: 0, ... }, usedReferences: [...], ballots: [...] }
+   Same JSON-file "database" style as your existing backend.
    ---------------------------------------------------------------------- */
 const DEFAULT_CANDIDATE_IDS = ["a1", "a2", "a3", "a4", "a5", "a6"];
 
@@ -38,7 +43,7 @@ function loadDB(){
   if(!fs.existsSync(DB_FILE)){
     const initial = {
       candidates: Object.fromEntries(DEFAULT_CANDIDATE_IDS.map(id => [id, 0])),
-      usedReferences: [],
+      transactions: {},   // keyed by CheckoutRequestID
       ballots: []
     };
     fs.writeFileSync(DB_FILE, JSON.stringify(initial, null, 2));
@@ -51,8 +56,7 @@ function saveDB(db){
 }
 
 /* -------------------------------------------------------------------------
-   GET /api/candidates — the frontend polls this to get real, shared vote
-   counts for every candidate.
+   GET /api/candidates
    ---------------------------------------------------------------------- */
 app.get("/api/candidates", (req, res) => {
   const db = loadDB();
@@ -60,62 +64,115 @@ app.get("/api/candidates", (req, res) => {
 });
 
 /* -------------------------------------------------------------------------
-   POST /api/vote/verify — called after the Paystack popup reports success.
-   This is the important part: we do NOT trust the frontend. We ask
-   Paystack directly whether this reference really was paid, then credit
-   the vote only if it checks out.
+   POST /api/payhero/stkpush — triggers the PIN prompt on the voter's phone
    ---------------------------------------------------------------------- */
-app.post("/api/vote/verify", async (req, res) => {
+app.post("/api/payhero/stkpush", async (req, res) => {
   try{
-    const { reference, candidateId, votes, voterName, relationship, reasons, customReason, rating } = req.body;
+    const { phone, candidateId, votes, voterName, relationship, reasons, customReason, rating } = req.body;
 
-    if(!reference || !candidateId || !votes){
-      return res.status(400).json({ ok: false, error: "Missing reference, candidateId, or votes." });
+    if(!phone || !candidateId || !votes){
+      return res.status(400).json({ ok: false, error: "Missing phone, candidateId, or votes." });
+    }
+
+    let cleanPhone = phone.replace(/\D/g, "");
+    if(cleanPhone.startsWith("254")) cleanPhone = "0" + cleanPhone.slice(3); // PayHero examples use 07XXXXXXXX format
+    if(!cleanPhone.startsWith("0")) cleanPhone = "0" + cleanPhone;
+
+    const amount = Number(votes) * PRICE_PER_VOTE;
+    const externalReference = "vote_" + candidateId + "_" + Date.now();
+
+    const stkRes = await fetch("https://backend.payhero.co.ke/api/v2/payments", {
+      method: "POST",
+      headers: {
+        Authorization: PAYHERO_AUTH_TOKEN,   // already the full "Basic xxxx" string
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify({
+        amount,
+        phone_number: cleanPhone,
+        channel_id: Number(PAYHERO_CHANNEL_ID),
+        provider: "m-pesa",
+        external_reference: externalReference,
+        customer_name: voterName,
+        callback_url: PAYHERO_CALLBACK_URL
+      })
+    });
+    const stkData = await stkRes.json();
+
+    if(!stkData.CheckoutRequestID){
+      console.error("PayHero STK push failed:", stkData);
+      return res.status(502).json({ ok: false, error: stkData.error_message || "Could not start the M-Pesa prompt." });
     }
 
     const db = loadDB();
-
-    // 1. Reject if this payment reference was already credited (stops double-voting via refresh/retry)
-    if(db.usedReferences.includes(reference)){
-      return res.status(409).json({ ok: false, error: "This payment has already been credited." });
-    }
-
-    // 2. Ask Paystack directly whether this transaction really succeeded
-    const verifyRes = await fetch(`https://api.paystack.co/transaction/verify/${encodeURIComponent(reference)}`, {
-      headers: { Authorization: `Bearer ${PAYSTACK_SECRET_KEY}` }
-    });
-    const verifyData = await verifyRes.json();
-
-    if(!verifyData.status || verifyData.data?.status !== "success"){
-      return res.status(402).json({ ok: false, error: "Payment could not be verified as successful." });
-    }
-
-    // 3. Make sure the amount actually paid matches what the vote count should cost
-    //    (stops someone paying for 1 vote but claiming 100 in the request body)
-    const expectedAmount = Number(votes) * PRICE_PER_VOTE * 100; // Paystack amounts are in subunits (kobo/cents)
-    if(verifyData.data.amount < expectedAmount){
-      return res.status(402).json({ ok: false, error: "Amount paid does not match votes requested." });
-    }
-
-    // 4. All good — credit the vote
-    if(!(candidateId in db.candidates)) db.candidates[candidateId] = 0;
-    db.candidates[candidateId] += Number(votes);
-    db.usedReferences.push(reference);
-    db.ballots.push({
-      reference, candidateId, votes: Number(votes), voterName, relationship,
-      reasons, customReason, rating, amount: verifyData.data.amount / 100,
-      timestamp: new Date().toISOString()
-    });
+    db.transactions[stkData.CheckoutRequestID] = {
+      candidateId, votes: Number(votes), voterName, relationship,
+      reasons, customReason, rating, amount, phone: cleanPhone,
+      externalReference, status: "pending"
+    };
     saveDB(db);
 
-    res.json({ ok: true, candidates: db.candidates });
+    res.json({ ok: true, checkoutRequestId: stkData.CheckoutRequestID });
 
   } catch(err){
     console.error(err);
-    res.status(500).json({ ok: false, error: "Server error while verifying payment." });
+    res.status(500).json({ ok: false, error: "Server error while starting M-Pesa payment." });
   }
 });
 
-app.get("/", (req, res) => res.send("MatchdayVote backend is running."));
+/* -------------------------------------------------------------------------
+   POST /api/payhero/callback — PayHero calls THIS automatically once the
+   customer enters their PIN (or cancels/times out).
+   PayHero sends: { status: true/false, response: { CheckoutRequestID,
+   ResultCode, Status: "Success"/"Failed", MpesaReceiptNumber, ... } }
+   ---------------------------------------------------------------------- */
+app.post("/api/payhero/callback", (req, res) => {
+  try{
+    const payload = req.body?.response;
+    if(!payload) return res.sendStatus(400);
+
+    const checkoutRequestId = payload.CheckoutRequestID;
+    const success = payload.ResultCode === 0 && payload.Status === "Success";
+
+    const db = loadDB();
+    const txn = db.transactions[checkoutRequestId];
+
+    if(!txn){
+      console.warn("Callback for unknown transaction:", checkoutRequestId);
+      return res.sendStatus(200);
+    }
+
+    if(success){
+      if(!(txn.candidateId in db.candidates)) db.candidates[txn.candidateId] = 0;
+      db.candidates[txn.candidateId] += txn.votes;
+      db.ballots.push({
+        ...txn, checkoutRequestId,
+        mpesaReceipt: payload.MpesaReceiptNumber,
+        timestamp: new Date().toISOString()
+      });
+      txn.status = "completed";
+    } else {
+      txn.status = "failed";
+    }
+    saveDB(db);
+
+    res.sendStatus(200);
+  } catch(err){
+    console.error(err);
+    res.sendStatus(500);
+  }
+});
+
+/* -------------------------------------------------------------------------
+   GET /api/payhero/status/:checkoutRequestId — the frontend polls this
+   ---------------------------------------------------------------------- */
+app.get("/api/payhero/status/:id", (req, res) => {
+  const db = loadDB();
+  const txn = db.transactions[req.params.id];
+  if(!txn) return res.status(404).json({ status: "unknown" });
+  res.json({ status: txn.status });
+});
+
+app.get("/", (req, res) => res.send("MatchdayVote backend (PayHero) is running."));
 
 app.listen(PORT, () => console.log(`MatchdayVote backend listening on port ${PORT}`));
