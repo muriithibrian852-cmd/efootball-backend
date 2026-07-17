@@ -1,7 +1,7 @@
 {
   "name": "matchdayvote-backend",
-  "version": "1.0.0",
-  "description": "Backend for MatchdayVote — verifies Paystack payments and stores shared vote counts.",
+  "version": "4.0.0-payhero",
+  "description": "Backend for MatchdayVote — M-Pesa payments via PayHero, JSON-file storage, no Paystack.",
   "main": "server.js",
   "scripts": {
     "start": "node server.js"
